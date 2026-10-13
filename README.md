@@ -64,10 +64,10 @@ The script runs in five logical stages:
 ### Stage details
 
 **(1) Peptide → identifier map.**
-Read `peptides.tsv`. Each row associates a peptide with an identifier
-(e.g. `AltP43s`). Only rows whose identifier is in the requested set
-(`--pattern-ids`, default: a built-in short set) are kept. The output
-is `{peptide: {id1, id2, ...}}` — a peptide may map to several ids.
+Read `peptides.tsv`. Each row associates a peptide with an identifier.
+Only rows whose identifier is in the requested set (`--pattern-ids`,
+default: a built-in set) are kept. The output is
+`{peptide: {id1, id2, ...}}` — a peptide may map to several ids.
 
 **(2) Aho-Corasick automaton.**
 Build a single automaton over all peptide patterns so that all peptides
@@ -83,10 +83,10 @@ so repeated headers don't inflate counts.
 The two catalogs use different header conventions, so they are parsed
 separately:
 
-- **MetamORF** header example:
-  `>... chr=chr6 strand=+ start_pos=13696809 stop_pos=13696893 ...`
-- **nuORFdb** header example:
-  `>chr6_13696809-13696893:+|...`
+- **MetamORF** header example (synthetic):
+  `>... chr=chr<C> strand=<+|- > start_pos=<int> stop_pos=<int> ...`
+- **nuORFdb** header example (synthetic):
+  `>chr<C>_<start>-<end>:<strand>|<...>`
 
 **(4) Merge and collapse.**
 Loci from both catalogs are merged per peptide. Overlapping intervals
@@ -118,23 +118,23 @@ The result is one row per (BAM, peptide, locus) with ≥1 hit.
 
 A tab-separated file with a header row. Each subsequent row pairs a
 peptide sequence with an identifier that groups it with other peptides
-from the same source (e.g. `AltP43s`, `AltP43L`).
+from the same source.
 
 | Column | Name (suggested) | Type   | Required | Description |
 |--------|------------------|--------|----------|-------------|
 | 1      | `peptide`        | string | yes      | Amino-acid sequence to search for. Uppercase, one-letter codes, no whitespace. Must be a substring of some translated ORF to yield a hit. |
-| 2      | `identifier`     | string | yes      | Group label (e.g. `AltP43s`). Only identifiers in the requested set (`--pattern-ids`) are kept. |
+| 2      | `identifier`     | string | yes      | Group label. Only identifiers in the requested set (`--pattern-ids`) are kept. |
 
 Additional columns are ignored. Blank lines and rows with fewer than
 two fields are skipped.
 
-**Example:**
+**Example (synthetic):**
 
 ```
 peptide	identifier
-NRDSTILEL	AltP43s
-RIIKVASMK	AltP11s
-LEQLEQQVK	AltP59s
+PEPTIDE1	GROUP_A
+PEPTIDE2	GROUP_B
+PEPTIDE3	GROUP_C
 ```
 
 **Notes:**
@@ -149,29 +149,21 @@ LEQLEQQVK	AltP59s
 - Any peptide whose length is `L` requires reads of at least `3L`
   aligned nucleotides to be considered — the script silently drops
   shorter reads before translation.
-- The default identifier set is:
-
-  ```
-  AltP43s, AltP11s, AltP59s, AltP42s, AltP13s,
-  AltP53s, AltP19s, AltP39s, AltP23s, AltP34s
-  ```
-
-  To use a different set, pass `--pattern-ids id1,id2,...`.
+- By default, only a preset list of identifiers is kept. To use a
+  different set, pass `--pattern-ids id1,id2,...`.
 
 ### 3.2 `--nuorf`: nuORFdb protein FASTA
 
-Protein sequences from
-[nuORFdb](https://www.weizmann.ac.il/molgen/segallab/nuorfdb) v1.2 or
-later. Headers must be of the form:
+Protein sequences from nuORFdb. Headers must be of the form:
 
 ```
 >chr<chrom>_<start>-<end>:<strand>|<...>
 ```
 
-Example:
+Synthetic example:
 
 ```
->chr6_13696809-13696893:+|ENST00000259915.9|...
+>chr<C>_<start>-<end>:<strand>|<transcript_id>|...
 ```
 
 The script parses `chrom`, `start`, `end`, and `strand` from the part
@@ -179,12 +171,11 @@ before the first `|`. Coordinates are treated as 1-based inclusive.
 
 ### 3.3 `--metamorf`: MetamORF protein FASTA
 
-Protein sequences from
-[MetamORF](https://metamorf.hbcc.uni-koeln.de/). Headers are expected
-to contain the following whitespace-separated `key=value` pairs:
+Protein sequences from MetamORF. Headers are expected to contain the
+following whitespace-separated `key=value` pairs:
 
 ```
->... chr=chr6 strand=+ start_pos=13696809 stop_pos=13696893 ...
+>... chr=chr<C> strand=<+|- > start_pos=<int> stop_pos=<int> ...
 ```
 
 Only these four keys are read; all other content is ignored.
@@ -207,8 +198,8 @@ for b in *.bam; do
 done
 ```
 
-Chromosome naming must match the catalogs. MetamORF uses `chr6`,
-nuORFdb uses bare `6`; the script prepends `chr` to whatever the locus
+Chromosome naming must match the catalogs. Some catalogs use `chr6`,
+others use bare `6`; the script prepends `chr` to whatever the locus
 parser yields, so both catalogs end up producing `chr6` for fetching.
 
 ---
@@ -246,11 +237,11 @@ least one hit:
 Information-level messages go to stderr so stdout/TSV stays clean:
 
 ```
-[info] 32 distinct peptide patterns for 12 ids
-[info] 28 / 32 peptides have loci
-[info] 43 BAM files to scan
-Total Hits: 9
-[info] wrote 6 rows to hits.tsv
+[info] N distinct peptide patterns for M ids
+[info] K / N peptides have loci
+[info] B BAM files to scan
+Total Hits: H
+[info] wrote R rows to hits.tsv
 ```
 
 `Total Hits` is the sum of the `hits` column — **not** the number of
@@ -263,7 +254,7 @@ rows.
 ```bash
 python pep2rna.py \
     --peptides  peptides.tsv \
-    --nuorf     /path/to/PA_nuORFdb_v1.2_protein.fasta \
+    --nuorf     /path/to/nuORFdb_protein.fasta \
     --metamorf  /path/to/MetamORF_Hsapiens_aa.fasta \
     --bam-dir   /path/to/BAM/ \
     --workers   28 \
@@ -280,7 +271,7 @@ Run `python pep2rna.py --help` for the full option list.
 | `--nuorf` | required | nuORFdb FASTA. |
 | `--metamorf` | required | MetamORF FASTA. |
 | `--bam-dir` | required | Directory of indexed BAMs. |
-| `--pattern-ids` | built-in short set | Comma-separated identifiers to keep. |
+| `--pattern-ids` | built-in set | Comma-separated identifiers to keep. |
 | `--output` | `hits.tsv` | Output TSV path. |
 | `--workers` | `28` | Worker processes for the BAM scan. |
 | `--min-mapq` | `0` | Minimum MAPQ for a read to count. |
