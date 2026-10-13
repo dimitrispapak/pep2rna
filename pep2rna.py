@@ -1,462 +1,232 @@
-import multiprocessing as mp
-from collections import defaultdict
-from dataclasses import dataclass
-from typing import Iterable, List, Tuple
-
+import os
+import re
 import pysam
+import ahocorasick
 from Bio.Data import CodonTable
-from Bio.Seq import Seq
+from multiprocessing import Pool
+from collections import Counter
+from collections import defaultdict
 
-"""
-pep2rna.py — Find genomic loci encoding a peptide and count supporting reads.
+short = {"AltP43s", "AltP11s", "AltP59s", "AltP42s", "AltP13s",
+         "AltP53s", "AltP19s", "AltP39s", "AltP23s", "AltP34s"}
 
-Parallel, load-balanced version:
-  * Genome scan: fixed-size windows with peptide-length overlap.
-  * Read counting: loci clustered so overlapping ones share a worker.
-  * Per-window mapped-read counting for a matched CPM denominator.
-"""
+long  = {"AltP26L", "AltP25L", "AltP43L", "AltP59L", "AltP42L",
+         "AltP13L", "AltP53L", "AltP19L", "AltP39L", "AltP40L",
+         "AltP23L", "AltP34L"}
 
+nuORF = "/home/dimitris/Workspace/reference/PA_nuORFdb_v1.2_protein.fasta"
+MetamORF = "/home/dimitris/Workspace/reference/MetamORF_Hsapiens_aa.fasta"
 
-
-# ---------------------------------------------------------------------------
-# Genetic code
-# ---------------------------------------------------------------------------
-_TABLE = CodonTable.unambiguous_dna_by_id[1]
-CODON_TO_AA = dict(_TABLE.forward_table)
-for _s in _TABLE.stop_codons:
-    CODON_TO_AA[_s] = "*"
-
-AA_TO_CODONS = {}
-for _codon, _aa in CODON_TO_AA.items():
-    AA_TO_CODONS.setdefault(_aa, []).append(_codon)
-
-
-def _translate_nt(nt: str) -> str:
-    """Fast translation without Bio.Seq overhead."""
-    out = []
-    for i in range(0, len(nt) - 2, 3):
-        out.append(CODON_TO_AA.get(nt[i:i + 3], "X"))
-    return "".join(out)
-
-
-# ---------------------------------------------------------------------------
-# Worker state (set once per process via Pool initializer)
-# ---------------------------------------------------------------------------
-_WORKER: dict = {}
-
-
-def _init_genome_worker(reference_fasta: str, peptide: str) -> None:
-    _WORKER["ref"] = pysam.FastaFile(reference_fasta)
-    _WORKER["peptide"] = peptide
-    _WORKER["L"] = len(peptide) * 3
-    _WORKER["chrom_len"] = {}
-
-
-def _init_count_worker(cram_path: str, reference_fasta: str,
-                       peptide: str, min_mapq: int,
-                       require_full_span: bool) -> None:
-    _WORKER["bam"] = pysam.AlignmentFile(
-        cram_path, "rc", reference_filename=reference_fasta
-    )
-    _WORKER["peptide"] = peptide
-    _WORKER["L"] = len(peptide) * 3
-    _WORKER["min_mapq"] = min_mapq
-    _WORKER["require_full_span"] = require_full_span
-
-
-def _init_mapped_worker(cram_path: str, reference_fasta: str,
-                        min_mapq: int) -> None:
-    _WORKER["bam"] = pysam.AlignmentFile(
-        cram_path, "rc", reference_filename=reference_fasta
-    )
-    _WORKER["min_mapq"] = min_mapq
-
-
-# ---------------------------------------------------------------------------
-# Locus finding
-# ---------------------------------------------------------------------------
-def find_peptide_loci_in_sequence(seq: str, peptide: str,
-                                  chrom: str) -> List[Tuple[str, int, int, str]]:
-    """
-    Find all loci (both strands, all frames) encoding `peptide`.
-    Uses translation + str.find — much faster than regex.
-    """
-    hits: List[Tuple[str, int, int, str]] = []
-    L = len(peptide) * 3
-    n = len(seq)
-
-    for frame in range(3):
-        sub = seq[frame: frame + ((n - frame) // 3) * 3]
-
-        # --- forward strand ---
-        prot = _translate_nt(sub)
-        start = 0
-        while True:
-            j = prot.find(peptide, start)
-            if j < 0:
-                break
-            gs = frame + j * 3
-            hits.append((chrom, gs, gs + L, "+"))
-            start = j + 1
-
-        # --- reverse strand ---
-        rc = str(Seq(sub).reverse_complement())
-        prot_rc = _translate_nt(rc)
-        sub_len = len(sub)
-        start = 0
-        while True:
-            j = prot_rc.find(peptide, start)
-            if j < 0:
-                break
-            gs = frame + sub_len - (j * 3 + L)
-            hits.append((chrom, gs, gs + L, "-"))
-            start = j + 1
-
-    return hits
-
-
-def _find_loci_in_window(task: Tuple[str, int, int, int]
-                         ) -> List[Tuple[str, int, int, str]]:
-    """
-    Scan [start, end) of `chrom` with `pad` nt of overlap on each side so
-    peptides straddling window boundaries are still found. Only hits
-    *starting* inside [start, end) are returned, so windows tile without
-    duplicates or gaps.
-    """
-    chrom, start, end, pad = task
-    ref = _WORKER["ref"]
-    peptide = _WORKER["peptide"]
-
-    chrom_len = _WORKER["chrom_len"].get(chrom)
-    if chrom_len is None:
-        chrom_len = ref.get_reference_length(chrom)
-        _WORKER["chrom_len"][chrom] = chrom_len
-
-    s = max(0, start - pad)
-    e = min(chrom_len, end + pad)
-    seq = ref.fetch(chrom, s, e).upper()
-
-    raw = find_peptide_loci_in_sequence(seq, peptide, chrom)
-
-    out = []
-    for (c, hs, he, strand) in raw:
-        gs, ge = hs + s, he + s
-        if start <= gs < end:
-            out.append((c, gs, ge, strand))
-    return out
-
-
-def _plan_windows(reference_fasta: str,
-                  window: int) -> List[Tuple[str, int, int, int]]:
-    tasks = []
-    with pysam.FastaFile(reference_fasta) as ref:
-        for chrom in ref.references:
-            length = ref.get_reference_length(chrom)
-            for start in range(0, length, window):
-                end = min(start + window, length)
-                tasks.append((chrom, start, end, 0))
-    return tasks
-
-
-def find_all_loci_parallel(reference_fasta: str, peptide: str,
-                           n_jobs: int = None,
-                           window: int = 5_000_000
-                           ) -> List[Tuple[str, int, int, str]]:
-    """
-    Scan the whole genome for peptide-encoding loci, load-balanced.
-    `window` controls task granularity (5 Mb ≈ 600 tasks for human).
-    """
-    if n_jobs is None:
-        n_jobs = min(mp.cpu_count(), 16)
-
-    pad = 3 * len(peptide)
-    tasks = [(c, s, e, pad)
-             for (c, s, e, _) in _plan_windows(reference_fasta, window)]
-
-    loci: List[Tuple[str, int, int, str]] = []
-    with mp.Pool(
-        processes=n_jobs,
-        initializer=_init_genome_worker,
-        initargs=(reference_fasta, peptide),
-    ) as pool:
-        for chunk in pool.imap_unordered(_find_loci_in_window, tasks,
-                                         chunksize=1):
-            loci.extend(chunk)
-
-    return loci
-
-
-# ---------------------------------------------------------------------------
-# Locus clustering for safe parallel counting
-# ---------------------------------------------------------------------------
-@dataclass
-class _Cluster:
-    loci: List[Tuple[str, int, int, str]]
-    start: int
-    end: int
-    chrom: str
-
-
-def _cluster_loci(loci: Iterable[Tuple[str, int, int, str]],
-                  gap: int) -> List[_Cluster]:
-    """Group loci within `gap` nt on the same chromosome."""
-    by_chrom: dict = defaultdict(list)
-    for loc in loci:
-        by_chrom[loc[0]].append(loc)
-
-    clusters: List[_Cluster] = []
-    for chrom, locs in by_chrom.items():
-        locs.sort(key=lambda x: x[1])
-        cur: List[Tuple[str, int, int, str]] = []
-        cur_start = cur_end = None
-        for loc in locs:
-            if not cur:
-                cur = [loc]
-                cur_start, cur_end = loc[1], loc[2]
-                continue
-            if loc[1] - cur_end <= gap:
-                cur.append(loc)
-                cur_end = max(cur_end, loc[2])
-            else:
-                clusters.append(_Cluster(cur, cur_start, cur_end, chrom))
-                cur = [loc]
-                cur_start, cur_end = loc[1], loc[2]
-        if cur:
-            clusters.append(_Cluster(cur, cur_start, cur_end, chrom))
-    return clusters
-
-
-# ---------------------------------------------------------------------------
-# Peptide-support read counting
-# ---------------------------------------------------------------------------
-def _count_reads_for_loci(loci: List[Tuple[str, int, int, str]]
-                          ) -> Tuple[int, dict]:
-    bam = _WORKER["bam"]
-    peptide = _WORKER["peptide"]
-    min_mapq = _WORKER["min_mapq"]
-    require_full_span = _WORKER["require_full_span"]
-
-    per_locus = defaultdict(int)
-    seen_reads = set()
-
-    for (chrom, start, end, strand) in loci:
-        try:
-            for read in bam.fetch(chrom, start, end):
-                if (read.is_unmapped or read.is_secondary
-                        or read.is_supplementary):
-                    continue
-                if read.mapping_quality < min_mapq:
-                    continue
-                qseq = read.query_sequence
-                if qseq is None:
-                    continue
-
-                if require_full_span:
-                    if (read.reference_start > start
-                            or read.reference_end < end):
-                        continue
-
-                ref_to_query = {}
-                for q, r in read.get_aligned_pairs(matches_only=True):
-                    if start <= r < end:
-                        ref_to_query[r] = q
-
-                nt = []
-                ok = True
-                for r in range(start, end):
-                    q = ref_to_query.get(r)
-                    if q is None:
-                        ok = False
-                        break
-                    nt.append(qseq[q])
-                if not ok:
-                    continue
-                nt = "".join(nt)
-
-                if strand == "-":
-                    nt = str(Seq(nt).reverse_complement())
-
-                if _translate_nt(nt) != peptide:
-                    continue
-
-                key = (read.query_name, read.reference_start, strand)
-                if key not in seen_reads:
-                    seen_reads.add(key)
-                    per_locus[(chrom, start, end, strand)] += 1
-        except ValueError:
+# ---- 1. build the pattern -> ids map ---------------------------------------
+pattern_to_ids = {}   # p -> set of ids that produced p
+with open('peptides.tsv') as f:
+    next(f)
+    for line in f:
+        fields = line.rstrip('\n').split('\t')
+        if len(fields) < 2:
+            continue
+        peptide, id_ = fields[0].strip(), fields[1].strip()
+        if id_ in short:
+            pats = [peptide]
+#        elif id_ in long:
+#            pats = [peptide[i:i+8] for i in range(len(peptide) - 7)]
+        else:
             continue
 
-    return sum(per_locus.values()), dict(per_locus)
+        for p in pats:
+            pattern_to_ids.setdefault(p, set()).add(id_)
+
+# ---- 2. build the automaton ------------------------------------------------
+A = ahocorasick.Automaton()
+for p in pattern_to_ids:
+    A.add_word(p, p)
+A.make_automaton()
+
+# ---- 3. scan the nuORF, filling the results dict ---------------------------
+MetamORF_results = {p: {"ids": sorted(pattern_to_ids[p]), "loci": []}
+           for p in pattern_to_ids}
+
+seen = {p: set() for p in pattern_to_ids}   # dedupe loci per peptide
+
+with open(MetamORF) as f:
+    header = ''
+    for line in f:
+        if line.startswith('>'):
+            header = line.rstrip('\n')[1:]   # drop the leading '>'
+            continue
+        seq = line.rstrip('\n')
+        for _, p in A.iter(seq):
+            if header not in seen[p]:
+                seen[p].add(header)
+                chrom  = re.search(r'\bchr=(\S+)',       header).group(1)
+                strand = re.search(r'\bstrand=(\S+)',    header).group(1)
+                start  = re.search(r'\bstart_pos=(\d+)', header).group(1)
+                end    = re.search(r'\bstop_pos=(\d+)',  header).group(1)
+                MetamORF_results[p]["loci"].append((chrom, start,end,strand))
+
+# ---- 4. scan the nuORF, filling the results dict ---------------------------
+nuORF_results = {p: {"ids": sorted(pattern_to_ids[p]), "loci": []}
+           for p in pattern_to_ids}
+
+seen = {p: set() for p in pattern_to_ids}   # dedupe loci per peptide
+
+with open(nuORF) as f:
+    header = ''
+    for line in f:
+        if line.startswith('>'):
+            header = line.rstrip('\n')[1:]   # drop the leading '>'
+            continue
+        seq = line.rstrip('\n')
+        for _, p in A.iter(seq):
+            if header not in seen[p]:
+                seen[p].add(header)
+                core   = header.split('|')[0]
+                loc    = core.rsplit(':', 2)
+                chrom  = loc[0].rsplit('_', 1)[-1]
+                start, end = loc[1].split('-')
+                strand = loc[2]
+                nuORF_results[p]["loci"].append((chrom, start,end,strand))
+
+# -------- merge databases ------------------------
+_merged_ids  = defaultdict(set)
+_merged_loci = defaultdict(dict)   # peptide -> {tuple(locus): locus}
+
+for d in (nuORF_results, MetamORF_results):
+    for peptide, info in d.items():
+        _merged_ids[peptide].update(info.get("ids", []))
+        for locus in info.get("loci", []):
+            _merged_loci[peptide].setdefault(tuple(locus), locus)
+
+peptides = {
+    p: {"ids": sorted(_merged_ids[p]),
+        "loci": list(_merged_loci[p].values())}
+    for p in _merged_ids
+}
+# ---- merge overlaping loci --------------
+for info in peptides.values():
+    by_key = defaultdict(list)
+    for chrom, start, end, strand in info["loci"]:
+        by_key[(chrom, strand)].append((int(start), int(end)))
+
+    merged = []
+    for (chrom, strand), intervals in by_key.items():
+        intervals.sort()
+        s0, e0 = intervals[0]
+        for s, e in intervals[1:]:
+            if s <= e0:
+                e0 = max(e0, e)
+            else:
+                merged.append((chrom, str(s0), str(e0), strand))
+                s0, e0 = s, e
+        merged.append((chrom, str(s0), str(e0), strand))
+
+    info["loci"] = merged
+
+#for peptide,info in peptides.items():
+#    print(peptide,info['loci'])
+# ---- translation -----------------------------------------------------------
+_T = CodonTable.unambiguous_dna_by_id[1]
+CODON_TO_AA = {**_T.forward_table, **{s: "*" for s in _T.stop_codons}}
+_COMP = str.maketrans("ACGTNacgtn", "TGCANtgcan")
 
 
-def count_reads_parallel(cram_path: str, reference_fasta: str,
-                         loci: List[Tuple[str, int, int, str]],
-                         peptide: str, min_mapq: int = 0,
-                         require_full_span: bool = True,
-                         n_jobs: int = None) -> dict:
-    """
-    Count supporting reads in parallel with greedy load balancing.
-    """
-    if n_jobs is None:
-        n_jobs = min(mp.cpu_count(), 16)
-
-    if not loci:
-        return {"total": 0, "per_locus": {}}
-
-    # Cluster so reads spanning multiple loci go to one worker.
-    clusters = _cluster_loci(loci, gap=1000)
-
-    # Greedy LPT: largest cluster first, always to lightest bucket.
-    clusters.sort(key=lambda c: len(c.loci), reverse=True)
-    buckets: List[List[_Cluster]] = [[] for _ in range(n_jobs)]
-    weights = [0] * n_jobs
-    for cl in clusters:
-        i = weights.index(min(weights))
-        buckets[i].append(cl)
-        weights[i] += len(cl.loci)
-
-    tasks = [
-        [loc for cl in bucket for loc in cl.loci]
-        for bucket in buckets
-        if bucket
-    ]
-
-    with mp.Pool(
-        processes=n_jobs,
-        initializer=_init_count_worker,
-        initargs=(cram_path, reference_fasta, peptide,
-                  min_mapq, require_full_span),
-    ) as pool:
-        results = pool.map(_count_reads_for_loci, tasks)
-
-    per_locus: dict = defaultdict(int)
-    total = 0
-    for t, pl in results:
-        total += t
-        for k, v in pl.items():
-            per_locus[k] += v
-
-    return {"total": total, "per_locus": dict(per_locus)}
+def translate(nt):
+    return "".join(CODON_TO_AA.get(nt[i:i+3], "X")
+                   for i in range(0, len(nt) - 2, 3))
 
 
-# ---------------------------------------------------------------------------
-# Per-window mapped-read counting
-# ---------------------------------------------------------------------------
-def _count_mapped_in_window(task: Tuple[str, int, int]
-                            ) -> Tuple[Tuple[str, int, int], int]:
-    """
-    Count reads whose leftmost aligned position falls in [start, end).
-    Filters mirror the peptide-support counter so the denominator matches.
-    """
-    chrom, start, end = task
-    bam = _WORKER["bam"]
-    min_mapq = _WORKER["min_mapq"]
+def read_mrna(read):
+    """Transcript-space nucleotide sequence of the read, in mRNA orientation."""
+    qs = read.query_sequence
+    if qs is None:
+        return None
+    pairs = [(q, r) for q, r in read.get_aligned_pairs()
+             if q is not None and r is not None]
+    if read.is_reverse:
+        pairs = pairs[::-1]      # walk 5'->3' along the mRNA
+        return "".join(qs[q].translate(_COMP) for q, r in pairs)
+    return "".join(qs[q] for q, r in pairs)
 
-    count = 0
-    try:
-        for read in bam.fetch(chrom, start, end):
-            if (read.is_unmapped or read.is_secondary
-                    or read.is_supplementary):
-                continue
-            if read.mapping_quality < min_mapq:
-                continue
-            rs = read.reference_start
-            if start <= rs < end:
-                count += 1
-    except ValueError:
-        pass
-    return (chrom, start, end), count
+def get_bam(path):
+    if path not in _bam_cache:
+        _bam_cache[path] = pysam.AlignmentFile(path, "rb")
+    return _bam_cache[path]
 
 
-def _plan_mapped_windows(reference_fasta: str,
-                         window: int) -> List[Tuple[str, int, int]]:
-    tasks = []
-    with pysam.FastaFile(reference_fasta) as ref:
-        for chrom in ref.references:
-            length = ref.get_reference_length(chrom)
-            for start in range(0, length, window):
-                end = min(start + window, length)
-                tasks.append((chrom, start, end))
-    return tasks
+def process_bam(bam_file, peptides):
+    """Process a single BAM file across all peptides/loci.
+
+    `peptides` is a plain dict passed in (picklable)."""
+
+    bam_path = os.path.join(BASE_PATH, bam_file)
+    bam = pysam.AlignmentFile(bam_path, "rb")
+
+    local_hits = 0
+    per_bam_report = []
+
+    for PEPTIDE, info in peptides.items():
+        if not info["loci"]:
+            continue
+        for locus in info["loci"]:
+            CHROM = "chr" + locus[0]
+            START = int(locus[1])
+            END = int(locus[2])
+            STRAND = locus[3]
+            MIN_MAPQ = 0
+            n_reads = 0
+            n_hits = 0
+
+            for read in bam.fetch(CHROM, START - 1, END):
+                if read.mapping_quality < MIN_MAPQ:
+                    continue
+                if STRAND == "-" and not read.is_reverse:
+                    continue
+                if STRAND == "+" and read.is_reverse:
+                    continue
+
+                mrna = read_mrna(read)
+                if mrna is None or len(mrna) < 3 * len(PEPTIDE):
+                    continue
+
+                n_reads += 1
+
+                for frame in range(3):
+                    if PEPTIDE in translate(mrna[frame:]):
+                        n_hits += 1
+                        break
+
+            if n_hits > 0:
+                local_hits += n_hits
+                per_bam_report.append(
+                    f"{bam_file}  {CHROM}:{START}-{END} ({STRAND})  "
+                    f"reads={n_reads}  hits={n_hits}  peptide={PEPTIDE}"
+                )
+
+    bam.close()
+    return bam_file, local_hits, per_bam_report
+
+# --- Globals that need to be visible in workers ---
+#BASE_PATH = "/mnt/pi_raid/raid/PJ2410297_20250115/ANALYSIS/BAM/" # 142 samples
+BASE_PATH = "/mnt/pi_raid/raid/PJ2406160_20240807_Integragen_Tessa/ANALYSIS/BAM/" # 43 samples 
+#BASE_PATH = "/mnt/pi_raid/raid/PJ2406160_20240909_Integragen_Tessa/ANALYSIS/BAM/" # 5 samples
+_bam_cache = {}
+
+def main():
+    contents = os.listdir(BASE_PATH)
+    bam_files = [x for x in contents if x.endswith("bam")]
+    total_hits = 0
+    with Pool(processes=28) as pool:
+        for bam_file, hits, report in pool.starmap(
+            process_bam,
+            [(bf, peptides) for bf in bam_files],
+            chunksize=1,
+        ):
+            total_hits += hits
+            for line in report:
+                print(line)
+
+    print("Total Hits:", total_hits)
 
 
-def count_mapped_per_window(cram_path: str, reference_fasta: str,
-                            min_mapq: int = 0,
-                            n_jobs: int = None,
-                            window: int = 1_000_000) -> dict:
-    """
-    Return per-window mapped-read counts and the total.
-    Each read is counted once, at its leftmost aligned position, so the
-    per-window counts sum to the total primary mapped reads passing MAPQ.
-    """
-    if n_jobs is None:
-        n_jobs = min(mp.cpu_count(), 16)
-
-    tasks = _plan_mapped_windows(reference_fasta, window)
-
-    per_window: dict = {}
-    with mp.Pool(
-        processes=n_jobs,
-        initializer=_init_mapped_worker,
-        initargs=(cram_path, reference_fasta, min_mapq),
-    ) as pool:
-        for key, cnt in pool.imap_unordered(_count_mapped_in_window, tasks,
-                                            chunksize=4):
-            per_window[key] = cnt
-
-    total = sum(per_window.values())
-    return {"per_window": per_window, "total": total}
-
-
-# ---------------------------------------------------------------------------
-# Top-level pipeline
-# ---------------------------------------------------------------------------
-def quantify_peptide(cram_path: str, reference_fasta: str, peptide: str,
-                     min_mapq: int = 0,
-                     require_full_span: bool = True,
-                     n_jobs: int = None,
-                     window: int = 5_000_000,
-                     mapped_window: int = 1_000_000) -> dict:
-    loci = find_all_loci_parallel(
-        reference_fasta, peptide, n_jobs=n_jobs, window=window
-    )
-
-    counts = count_reads_parallel(
-        cram_path, reference_fasta, loci, peptide,
-        min_mapq=min_mapq, require_full_span=require_full_span,
-        n_jobs=n_jobs,
-    )
-
-    mapped = count_mapped_per_window(
-        cram_path, reference_fasta, min_mapq=min_mapq,
-        n_jobs=n_jobs, window=mapped_window,
-    )
-    counts["total_mapped"] = mapped["total"]
-    counts["mapped_per_window"] = mapped["per_window"]
-
-    counts["cpm"] = (counts["total"] / mapped["total"] * 1e6
-                     if mapped["total"] else 0.0)
-    counts["n_loci"] = len(loci)
-    return counts
-
-
-# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    peptide = "RQFEPRIQY"
-    cram_path = ("/home/dimitris/Workspace/postdoc/Darvac/wes_pipeline/"
-                 "results/preprocessing/recalibrated/16H1303-2_LGD/"
-                 "16H1303-2_LGD.recal.cram")
-    reference_fasta = ("/home/dimitris/Workspace/reference/"
-                       "Homo_sapiens_assembly38.fasta")
-
-    result = quantify_peptide(
-        cram_path, reference_fasta, peptide,
-        n_jobs=16,
-        window=5_000_000,
-        mapped_window=1_000_000,
-    )
-
-    print("total peptide-supporting reads:", result["total"])
-    print("total mapped reads (MAPQ-filtered, primary):", result["total_mapped"])
-    print("CPM:", result["cpm"])
-    print("n_loci:", result["n_loci"])
+    main()
