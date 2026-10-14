@@ -11,6 +11,7 @@ env/
 *.bam
 *.bai
 *.sam
+*.bak
 
 # editor
 .vscode/
