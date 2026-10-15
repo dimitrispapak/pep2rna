@@ -1,7 +1,7 @@
 """Aho-Corasick automaton builders (exact and flexible)."""
 import ahocorasick
 
-from .patterns import PatternMap, FLEX_MIN_LEN
+from .patterns import FLEX_MIN_LEN, PatternMap
 
 
 def build_exact(pattern_to_ids: PatternMap) -> ahocorasick.Automaton | None:

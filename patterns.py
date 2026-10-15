@@ -1,37 +1,23 @@
-"""Peptide TSV parsing and the short/long split."""
+"""Peptide TSV parsing and short/long split."""
 from dataclasses import dataclass
-from typing import Dict, Set
-
-
-DEFAULT_SHORT_IDS = {
-    "AltP43s", "AltP11s", "AltP59s", "AltP42s", "AltP13s",
-    "AltP53s", "AltP19s", "AltP39s", "AltP23s", "AltP34s",
-}
-
-LONG_IDS = {
-    "AltP26L", "AltP25L", "AltP43L", "AltP59L", "AltP42L", "AltP13L",
-    "AltP53L", "AltP19L", "AltP39L", "AltP40L", "AltP23L", "AltP34L",
-}
-
-FLEX_MIN_LEN = 8
+from typing import Dict, Iterable, Set
 
 # type alias: peptide -> set of target ids
 PatternMap = Dict[str, Set[str]]
 
+# Minimum length for a flexible (substring) match.
+FLEX_MIN_LEN = 8
+
 
 @dataclass
 class PatternSets:
-    """Peptides split into exact (short) and flexible (long) groups."""
+    """Peptides split into exact (strict) and flexible (substring) groups."""
     exact: PatternMap
     flexible: PatternMap
 
-    @property
-    def all_peptides(self):
-        return {**self.exact, **self.flexible}
 
-
-def read_peptides_tsv(path: str, keep_ids: Set[str]) -> PatternMap:
-    """Read TSV (col1=peptide, col2=id, with header); keep only kept ids."""
+def read_peptides_tsv(path: str) -> PatternMap:
+    """Read TSV (col1=peptide, col2=id, with header). No filtering."""
     out: PatternMap = {}
     with open(path) as f:
         next(f)
@@ -40,15 +26,31 @@ def read_peptides_tsv(path: str, keep_ids: Set[str]) -> PatternMap:
             if len(fields) < 2:
                 continue
             peptide, id_ = fields[0].strip(), fields[1].strip()
-            if id_ not in keep_ids:
+            if not peptide or not id_:
                 continue
             out.setdefault(peptide, set()).add(id_)
     return out
 
 
-def split_short_long(pattern_map: PatternMap,
-                     long_ids: Set[str] = LONG_IDS) -> PatternSets:
+def read_id_list(path: str) -> Set[str]:
+    """One id per line; blank lines and '#' comments ignored."""
+    ids: Set[str] = set()
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            ids.add(line)
+    return ids
+
+def split_patterns(pattern_map: PatternMap,
+                   flexible_ids: Set[str] | None = None) -> PatternSets:
+    """
+    Split into exact vs flexible based on whether any of a peptide's ids is
+    in `flexible_ids`. If `flexible_ids` is None/empty, everything is exact.
+    """
+    flexible_ids = flexible_ids or set()
     exact, flexible = {}, {}
     for peptide, ids in pattern_map.items():
-        (flexible if ids & long_ids else exact)[peptide] = ids
+        (flexible if ids & flexible_ids else exact)[peptide] = ids
     return PatternSets(exact=exact, flexible=flexible)

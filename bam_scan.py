@@ -10,24 +10,18 @@ from .translate import read_mrna, translate
 
 Row = Tuple[str, str, str, int, int, str, int, int]
 
-
-def _peptide_match(peptide: str, aa: str, flexible: bool) -> bool:
+def _peptide_match(peptide: str, aa: str, flexible: bool,
+                   min_len: int = FLEX_MIN_LEN) -> bool:
     if not flexible:
         return peptide in aa
-    for k in range(len(peptide), FLEX_MIN_LEN - 1, -1):
+    for k in range(len(peptide), min_len - 1, -1):
         for i in range(len(peptide) - k + 1):
             if peptide[i:i + k] in aa:
                 return True
     return False
 
-
-def process_bam(
-    bam_file: str,
-    bam_dir: str,
-    peptides: Dict[str, PeptideInfo],
-    min_mapq: int,
-    flexible_set: Set[str],
-) -> Tuple[str, int, List[Row]]:
+def process_bam(bam_file, bam_dir, peptides, min_mapq,
+                flexible_set, flex_min_len=FLEX_MIN_LEN):
     """Scan one BAM against all peptide loci."""
     bam_path = os.path.join(bam_dir, bam_file)
     bam = pysam.AlignmentFile(bam_path, "rb")
@@ -59,7 +53,7 @@ def process_bam(
                     n_reads += 1
                     for frame in range(3):
                         aa = translate(mrna[frame:])
-                        if _peptide_match(peptide, aa, flexible):
+                        if _peptide_match(peptide, aa, flexible, flex_min_len):
                             n_hits += 1
                             break
 
